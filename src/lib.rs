@@ -8,6 +8,7 @@ use web_sys::{
 };
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use wasm_bindgen_futures::JsFuture;
 
 struct SharedState {
@@ -162,8 +163,6 @@ impl P2PConnectionShared {
         let set_local_promise = self.peer_connection.set_local_description(&offer_sdp);
         JsFuture::from(set_local_promise).await?;
         
-        // Removed wait_for_ice_gathering to allow trickle ICE
-        
         let local_desc = self.peer_connection.local_description().ok_or("No local description")?;
         Ok(local_desc.sdp())
     }
@@ -181,8 +180,6 @@ impl P2PConnectionShared {
         
         let set_local_promise = self.peer_connection.set_local_description(&answer_sdp);
         JsFuture::from(set_local_promise).await?;
-
-        // Removed wait_for_ice_gathering to allow trickle ICE
 
         let local_desc = self.peer_connection.local_description().ok_or("No local description")?;
         Ok(local_desc.sdp())
@@ -261,5 +258,156 @@ impl P2PConnectionShared {
         } else {
             Err(JsValue::from_str("Data channel not established"))
         }
+    }
+}
+
+#[wasm_bindgen]
+pub struct PeerManager {
+    peers: Rc<RefCell<HashMap<String, Rc<P2PConnectionShared>>>>,
+    on_peer_message: Rc<RefCell<Option<js_sys::Function>>>,
+    on_peer_ice_candidate: Rc<RefCell<Option<js_sys::Function>>>,
+    on_peer_connection_state_change: Rc<RefCell<Option<js_sys::Function>>>,
+}
+
+#[wasm_bindgen]
+impl PeerManager {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> PeerManager {
+        console_error_panic_hook::set_once();
+        PeerManager {
+            peers: Rc::new(RefCell::new(HashMap::new())),
+            on_peer_message: Rc::new(RefCell::new(None)),
+            on_peer_ice_candidate: Rc::new(RefCell::new(None)),
+            on_peer_connection_state_change: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    pub fn add_peer(&self, peer_id: String) -> Result<(), JsValue> {
+        let connection = Rc::new(P2PConnectionShared::new()?);
+        
+        // Setup callbacks for this peer to route back to manager
+        
+        // Message Callback
+        let on_message_cb = self.on_peer_message.clone();
+        let pid = peer_id.clone();
+        let cb = Closure::wrap(Box::new(move |msg: String| {
+            let cb_opt = on_message_cb.borrow();
+            if let Some(func) = cb_opt.as_ref() {
+                let _ = func.call2(&JsValue::NULL, &JsValue::from_str(&pid), &JsValue::from_str(&msg));
+            }
+        }) as Box<dyn FnMut(String)>);
+        // We need to adapt the signature because P2PConnectionShared expects a function that takes a String (from the inner closure)
+        // Wait, P2PConnectionShared::set_on_message takes a js_sys::Function.
+        // The inner closure in P2PConnectionShared calls it with (JsValue::NULL, JsValue::from_str(&data)).
+        // So we need a js_sys::Function that accepts (data).
+        
+        // Let's create the JS function wrapper
+        let on_message_js_func: js_sys::Function = cb.into_js_value().unchecked_into();
+        connection.set_on_message(on_message_js_func);
+
+
+        // ICE Candidate Callback
+        let on_ice_cb = self.on_peer_ice_candidate.clone();
+        let pid_ice = peer_id.clone();
+        let cb_ice = Closure::wrap(Box::new(move |candidate_json: String| {
+            let cb_opt = on_ice_cb.borrow();
+            if let Some(func) = cb_opt.as_ref() {
+                let _ = func.call2(&JsValue::NULL, &JsValue::from_str(&pid_ice), &JsValue::from_str(&candidate_json));
+            }
+        }) as Box<dyn FnMut(String)>);
+        let on_ice_js_func: js_sys::Function = cb_ice.into_js_value().unchecked_into();
+        connection.set_on_ice_candidate(on_ice_js_func);
+
+
+        // Connection State Callback
+        let on_conn_cb = self.on_peer_connection_state_change.clone();
+        let pid_conn = peer_id.clone();
+        let cb_conn = Closure::wrap(Box::new(move |state: String| {
+            let cb_opt = on_conn_cb.borrow();
+            if let Some(func) = cb_opt.as_ref() {
+                let _ = func.call2(&JsValue::NULL, &JsValue::from_str(&pid_conn), &JsValue::from_str(&state));
+            }
+        }) as Box<dyn FnMut(String)>);
+        let on_conn_js_func: js_sys::Function = cb_conn.into_js_value().unchecked_into();
+        connection.set_on_connection_state_change(on_conn_js_func);
+
+        self.peers.borrow_mut().insert(peer_id, connection);
+        Ok(())
+    }
+
+    pub fn remove_peer(&self, peer_id: &str) {
+        if let Some(conn) = self.peers.borrow_mut().remove(peer_id) {
+            conn.close();
+        }
+    }
+
+    pub fn has_peer(&self, peer_id: &str) -> bool {
+        self.peers.borrow().contains_key(peer_id)
+    }
+
+    pub async fn create_offer(&self, peer_id: String) -> Result<String, JsValue> {
+        let peers = self.peers.borrow();
+        if let Some(conn) = peers.get(&peer_id) {
+            conn.create_offer().await
+        } else {
+            Err(JsValue::from_str("Peer not found"))
+        }
+    }
+
+    pub async fn create_answer(&self, peer_id: String, offer_sdp: String) -> Result<String, JsValue> {
+        let peers = self.peers.borrow();
+        if let Some(conn) = peers.get(&peer_id) {
+            conn.create_answer(offer_sdp).await
+        } else {
+            Err(JsValue::from_str("Peer not found"))
+        }
+    }
+
+    pub async fn receive_answer(&self, peer_id: String, answer_sdp: String) -> Result<(), JsValue> {
+        let peers = self.peers.borrow();
+        if let Some(conn) = peers.get(&peer_id) {
+            conn.receive_answer(answer_sdp).await
+        } else {
+            Err(JsValue::from_str("Peer not found"))
+        }
+    }
+
+    pub async fn add_ice_candidate(&self, peer_id: String, candidate_json: String) -> Result<(), JsValue> {
+        let peers = self.peers.borrow();
+        if let Some(conn) = peers.get(&peer_id) {
+            conn.add_ice_candidate(candidate_json).await
+        } else {
+            Err(JsValue::from_str("Peer not found"))
+        }
+    }
+
+    pub fn send_message(&self, peer_id: String, message: String) -> Result<(), JsValue> {
+        let peers = self.peers.borrow();
+        if let Some(conn) = peers.get(&peer_id) {
+            conn.send_message(&message)
+        } else {
+            Err(JsValue::from_str("Peer not found"))
+        }
+    }
+
+    pub fn broadcast_message(&self, message: String) -> Result<(), JsValue> {
+        let peers = self.peers.borrow();
+        for (_, conn) in peers.iter() {
+            // Ignore errors for individual peers, try to send to all
+            let _ = conn.send_message(&message);
+        }
+        Ok(())
+    }
+
+    pub fn set_on_peer_message(&self, callback: js_sys::Function) {
+        *self.on_peer_message.borrow_mut() = Some(callback);
+    }
+
+    pub fn set_on_peer_ice_candidate(&self, callback: js_sys::Function) {
+        *self.on_peer_ice_candidate.borrow_mut() = Some(callback);
+    }
+
+    pub fn set_on_peer_connection_state_change(&self, callback: js_sys::Function) {
+        *self.on_peer_connection_state_change.borrow_mut() = Some(callback);
     }
 }
