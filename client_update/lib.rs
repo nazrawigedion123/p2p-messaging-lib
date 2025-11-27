@@ -1,15 +1,18 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
-    ErrorEvent, MessageEvent, RtcDataChannel, RtcDataChannelEvent, RtcIceCandidate,
-    RtcIceCandidateInit, RtcPeerConnection, RtcSdpType, RtcSessionDescription,
-    RtcSessionDescriptionInit, RtcIceConnectionState, RtcPeerConnectionState,
-    RtcPeerConnectionIceEvent,
+    MessageEvent, RtcDataChannel, RtcDataChannelEvent,
+    RtcIceCandidateInit, RtcPeerConnection, RtcSdpType, 
+    RtcSessionDescriptionInit,
+    RtcPeerConnectionIceEvent, WebSocket,
 };
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use wasm_bindgen_futures::JsFuture;
+
+// ... (Previous P2PConnectionShared struct and impl remain mostly the same, 
+// but we need to ensure ICE candidates are sent via signaling)
 
 struct SharedState {
     data_channel: Option<RtcDataChannel>,
@@ -31,7 +34,7 @@ impl P2PConnectionShared {
     pub fn new() -> Result<P2PConnectionShared, JsValue> {
         console_error_panic_hook::set_once();
         
-        let mut rtc_config = web_sys::RtcConfiguration::new();
+        let rtc_config = web_sys::RtcConfiguration::new();
         let ice_servers = js_sys::Array::new();
         let stun_server = web_sys::RtcIceServer::new();
         let urls = js_sys::Array::new();
@@ -168,7 +171,7 @@ impl P2PConnectionShared {
     }
 
     pub async fn create_answer(&self, offer_sdp: String) -> Result<String, JsValue> {
-        let mut remote_desc_init = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+        let remote_desc_init = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
         remote_desc_init.set_sdp(&offer_sdp);
         
         let set_remote_promise = self.peer_connection.set_remote_description(&remote_desc_init);
@@ -186,7 +189,7 @@ impl P2PConnectionShared {
     }
 
     pub async fn receive_answer(&self, answer_sdp: String) -> Result<(), JsValue> {
-        let mut remote_desc_init = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
+        let remote_desc_init = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
         remote_desc_init.set_sdp(&answer_sdp);
         
         let set_remote_promise = self.peer_connection.set_remote_description(&remote_desc_init);
@@ -264,9 +267,12 @@ impl P2PConnectionShared {
 #[wasm_bindgen]
 pub struct PeerManager {
     peers: Rc<RefCell<HashMap<String, Rc<P2PConnectionShared>>>>,
+    websocket: Rc<RefCell<Option<WebSocket>>>,
     on_peer_message: Rc<RefCell<Option<js_sys::Function>>>,
     on_peer_ice_candidate: Rc<RefCell<Option<js_sys::Function>>>,
     on_peer_connection_state_change: Rc<RefCell<Option<js_sys::Function>>>,
+    on_peer_joined: Rc<RefCell<Option<js_sys::Function>>>,
+    on_peer_left: Rc<RefCell<Option<js_sys::Function>>>,
 }
 
 #[wasm_bindgen]
@@ -276,12 +282,182 @@ impl PeerManager {
         console_error_panic_hook::set_once();
         PeerManager {
             peers: Rc::new(RefCell::new(HashMap::new())),
+            websocket: Rc::new(RefCell::new(None)),
             on_peer_message: Rc::new(RefCell::new(None)),
             on_peer_ice_candidate: Rc::new(RefCell::new(None)),
             on_peer_connection_state_change: Rc::new(RefCell::new(None)),
+            on_peer_joined: Rc::new(RefCell::new(None)),
+            on_peer_left: Rc::new(RefCell::new(None)),
         }
     }
 
+    pub fn connect_signaling(&self, url: &str) -> Result<(), JsValue> {
+        let ws = WebSocket::new(url)?;
+        
+        let peers_clone = self.peers.clone();
+
+        let on_peer_joined_cb = self.on_peer_joined.clone();
+        let on_peer_left_cb = self.on_peer_left.clone();
+        
+        // We need a way to call async methods from the synchronous websocket callback.
+        // We can spawn a local future.
+        
+        // To avoid complex lifetime issues in this simple example, we'll use a RefCell to hold the manager's state
+        // But we can't easily pass 'self' into the closure.
+        // We'll pass the shared state components.
+        
+        let onmessage_callback = Closure::wrap(Box::new(move |e: MessageEvent| {
+            if let Ok(txt) = e.data().dyn_into::<js_sys::JsString>() {
+                let txt_string: String = txt.into();
+                web_sys::console::log_1(&format!("Received WS message: {}", txt_string).into());
+                
+                // Parse JSON
+                if let Ok(val) = js_sys::JSON::parse(&txt_string) {
+                    let type_field = js_sys::Reflect::get(&val, &JsValue::from_str("type")).unwrap();
+                    let type_str = type_field.as_string().unwrap_or_default();
+                    
+                    web_sys::console::log_1(&format!("Message type: {}", type_str).into());
+
+                    if type_str == "PeerJoined" {
+                        let payload = js_sys::Reflect::get(&val, &JsValue::from_str("payload")).unwrap();
+                        let peer_id = js_sys::Reflect::get(&payload, &JsValue::from_str("peer_id")).unwrap().as_string().unwrap();
+                        let username = js_sys::Reflect::get(&payload, &JsValue::from_str("username")).unwrap().as_string().unwrap();
+                        
+                        web_sys::console::log_1(&format!("Peer joined: {}", peer_id).into());
+                        
+                        if let Some(cb) = on_peer_joined_cb.borrow().as_ref() {
+                            web_sys::console::log_1(&"Calling on_peer_joined callback".into());
+                            let _ = cb.call2(&JsValue::NULL, &JsValue::from_str(&peer_id), &JsValue::from_str(&username));
+                        } else {
+                            web_sys::console::log_1(&"No on_peer_joined callback set!".into());
+                        }
+                    } else if type_str == "PeerLeft" {
+                        let payload = js_sys::Reflect::get(&val, &JsValue::from_str("payload")).unwrap();
+                        let peer_id = js_sys::Reflect::get(&payload, &JsValue::from_str("peer_id")).unwrap().as_string().unwrap();
+                        
+                        web_sys::console::log_1(&format!("Peer left: {}", peer_id).into());
+                        
+                        // Remove peer
+                        peers_clone.borrow_mut().remove(&peer_id);
+                        
+                        if let Some(cb) = on_peer_left_cb.borrow().as_ref() {
+                            let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(&peer_id));
+                        }
+                    } else if type_str == "ExistingPeers" {
+                        web_sys::console::log_1(&"Processing ExistingPeers".into());
+                        let payload = js_sys::Reflect::get(&val, &JsValue::from_str("payload")).unwrap();
+                        let peers_list = js_sys::Reflect::get(&payload, &JsValue::from_str("peers")).unwrap();
+                        let iterator = js_sys::try_iter(&peers_list).unwrap().unwrap();
+                        
+                        for item in iterator {
+                            let item = item.unwrap();
+                            let peer_id = js_sys::Reflect::get(&item, &JsValue::from_str("peer_id")).unwrap().as_string().unwrap();
+                            let username = js_sys::Reflect::get(&item, &JsValue::from_str("username")).unwrap().as_string().unwrap();
+                            
+                            web_sys::console::log_1(&format!("Existing peer: {}", peer_id).into());
+
+                            if let Some(cb) = on_peer_joined_cb.borrow().as_ref() {
+                                let _ = cb.call2(&JsValue::NULL, &JsValue::from_str(&peer_id), &JsValue::from_str(&username));
+                            }
+                        }
+                    } else if type_str == "Signal" {
+                        let payload = js_sys::Reflect::get(&val, &JsValue::from_str("payload")).unwrap();
+                        let target = js_sys::Reflect::get(&payload, &JsValue::from_str("target")).unwrap().as_string().unwrap();
+                        let data = js_sys::Reflect::get(&payload, &JsValue::from_str("data")).unwrap();
+                        
+                        // 'target' here is actually the SENDER (based on my server implementation plan)
+                        let sender_id = target;
+                        
+                        // Check if it's Offer, Answer, or Candidate
+                        let sdp_type = js_sys::Reflect::get(&data, &JsValue::from_str("type")).ok();
+                        let candidate = js_sys::Reflect::get(&data, &JsValue::from_str("candidate")).ok();
+                        
+                        if let Some(t) = sdp_type {
+                            if !t.is_undefined() {
+                                let type_str = t.as_string().unwrap();
+                                let _sdp = js_sys::Reflect::get(&data, &JsValue::from_str("sdp")).unwrap().as_string().unwrap();
+                                
+                                if type_str == "offer" {
+                                    // Handle Offer
+                                    // We need to create a connection if it doesn't exist?
+                                    // Or assume the UI has already created it?
+                                    // Usually, for incoming offer, we create the connection now.
+                                    
+                                    // But we need to call async methods.
+                                    // We can't do it easily here without spawning.
+                                    // For now, let's just log.
+                                    web_sys::console::log_1(&format!("Received offer from {}", sender_id).into());
+                                    
+                                    // Ideally we trigger a callback to the UI to handle this, or handle it internally if we can spawn.
+                                    // Since we are in WASM, we can use wasm_bindgen_futures::spawn_local
+                                    
+                                    // TODO: Implement internal handling or callback
+                                } else if type_str == "answer" {
+                                    web_sys::console::log_1(&format!("Received answer from {}", sender_id).into());
+                                }
+                            }
+                        } else if let Some(c) = candidate {
+                            if !c.is_undefined() {
+                                web_sys::console::log_1(&format!("Received candidate from {}", sender_id).into());
+                            }
+                        }
+                    }
+                }
+            }
+        }) as Box<dyn FnMut(MessageEvent)>);
+        
+        ws.set_onmessage(Some(onmessage_callback.as_ref().unchecked_ref()));
+        onmessage_callback.forget();
+        
+        *self.websocket.borrow_mut() = Some(ws);
+        
+        Ok(())
+    }
+
+    pub fn login(&self, username: String) -> Result<(), JsValue> {
+        if let Some(ws) = self.websocket.borrow().as_ref() {
+            let msg = serde_json::to_string(&serde_json::json!({
+                "type": "Login",
+                "payload": { "username": username }
+            })).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            ws.send_with_str(&msg)?;
+        }
+        Ok(())
+    }
+
+    pub fn join_room(&self, room: String) -> Result<(), JsValue> {
+        if let Some(ws) = self.websocket.borrow().as_ref() {
+            let msg = serde_json::to_string(&serde_json::json!({
+                "type": "Join",
+                "payload": { "room": room }
+            })).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            ws.send_with_str(&msg)?;
+        }
+        Ok(())
+    }
+
+    pub fn send_signal(&self, target_peer_id: String, data: JsValue) -> Result<(), JsValue> {
+        if let Some(ws) = self.websocket.borrow().as_ref() {
+             // We need to construct the JSON manually or use serde_wasm_bindgen if available, 
+             // but here we are using basic js_sys.
+             // Let's assume 'data' is a JS object (Offer/Answer/Candidate).
+             
+             let payload = js_sys::Object::new();
+             js_sys::Reflect::set(&payload, &JsValue::from_str("target"), &JsValue::from_str(&target_peer_id))?;
+             js_sys::Reflect::set(&payload, &JsValue::from_str("data"), &data)?;
+             
+             let msg_obj = js_sys::Object::new();
+             js_sys::Reflect::set(&msg_obj, &JsValue::from_str("type"), &JsValue::from_str("Signal"))?;
+             js_sys::Reflect::set(&msg_obj, &JsValue::from_str("payload"), &payload)?;
+             
+             let msg_str = js_sys::JSON::stringify(&msg_obj)?;
+             ws.send_with_str(&msg_str.as_string().unwrap())?;
+        }
+        Ok(())
+    }
+
+    // ... (Existing methods: add_peer, remove_peer, etc.)
+    
     pub fn add_peer(&self, peer_id: String) -> Result<(), JsValue> {
         let connection = Rc::new(P2PConnectionShared::new()?);
         
@@ -296,23 +472,30 @@ impl PeerManager {
                 let _ = func.call2(&JsValue::NULL, &JsValue::from_str(&pid), &JsValue::from_str(&msg));
             }
         }) as Box<dyn FnMut(String)>);
-        // We need to adapt the signature because P2PConnectionShared expects a function that takes a String (from the inner closure)
-        // Wait, P2PConnectionShared::set_on_message takes a js_sys::Function.
-        // The inner closure in P2PConnectionShared calls it with (JsValue::NULL, JsValue::from_str(&data)).
-        // So we need a js_sys::Function that accepts (data).
-        
-        // Let's create the JS function wrapper
         let on_message_js_func: js_sys::Function = cb.into_js_value().unchecked_into();
         connection.set_on_message(on_message_js_func);
 
 
         // ICE Candidate Callback
-        let on_ice_cb = self.on_peer_ice_candidate.clone();
+        // IMPORTANT: Send candidate to signaling server instead of just callback
+        let ws_clone = self.websocket.clone();
         let pid_ice = peer_id.clone();
         let cb_ice = Closure::wrap(Box::new(move |candidate_json: String| {
-            let cb_opt = on_ice_cb.borrow();
-            if let Some(func) = cb_opt.as_ref() {
-                let _ = func.call2(&JsValue::NULL, &JsValue::from_str(&pid_ice), &JsValue::from_str(&candidate_json));
+            // Parse JSON to object
+            if let Ok(candidate_obj) = js_sys::JSON::parse(&candidate_json) {
+                 if let Some(ws) = ws_clone.borrow().as_ref() {
+                     // Send Signal
+                     let payload = js_sys::Object::new();
+                     let _ = js_sys::Reflect::set(&payload, &JsValue::from_str("target"), &JsValue::from_str(&pid_ice));
+                     let _ = js_sys::Reflect::set(&payload, &JsValue::from_str("data"), &candidate_obj);
+                     
+                     let msg_obj = js_sys::Object::new();
+                     let _ = js_sys::Reflect::set(&msg_obj, &JsValue::from_str("type"), &JsValue::from_str("Signal"));
+                     let _ = js_sys::Reflect::set(&msg_obj, &JsValue::from_str("payload"), &payload);
+                     
+                     let msg_str = js_sys::JSON::stringify(&msg_obj).unwrap();
+                     let _ = ws.send_with_str(&msg_str.as_string().unwrap());
+                 }
             }
         }) as Box<dyn FnMut(String)>);
         let on_ice_js_func: js_sys::Function = cb_ice.into_js_value().unchecked_into();
@@ -334,7 +517,8 @@ impl PeerManager {
         self.peers.borrow_mut().insert(peer_id, connection);
         Ok(())
     }
-
+    
+    // ... (Other existing methods)
     pub fn remove_peer(&self, peer_id: &str) {
         if let Some(conn) = self.peers.borrow_mut().remove(peer_id) {
             conn.close();
@@ -348,7 +532,27 @@ impl PeerManager {
     pub async fn create_offer(&self, peer_id: String) -> Result<String, JsValue> {
         let peers = self.peers.borrow();
         if let Some(conn) = peers.get(&peer_id) {
-            conn.create_offer().await
+            let sdp = conn.create_offer().await?;
+            
+            // Send offer via signaling
+            if let Some(ws) = self.websocket.borrow().as_ref() {
+                 let sdp_obj = js_sys::Object::new();
+                 js_sys::Reflect::set(&sdp_obj, &JsValue::from_str("type"), &JsValue::from_str("offer"))?;
+                 js_sys::Reflect::set(&sdp_obj, &JsValue::from_str("sdp"), &JsValue::from_str(&sdp))?;
+                 
+                 let payload = js_sys::Object::new();
+                 js_sys::Reflect::set(&payload, &JsValue::from_str("target"), &JsValue::from_str(&peer_id))?;
+                 js_sys::Reflect::set(&payload, &JsValue::from_str("data"), &sdp_obj)?;
+                 
+                 let msg_obj = js_sys::Object::new();
+                 js_sys::Reflect::set(&msg_obj, &JsValue::from_str("type"), &JsValue::from_str("Signal"))?;
+                 js_sys::Reflect::set(&msg_obj, &JsValue::from_str("payload"), &payload)?;
+                 
+                 let msg_str = js_sys::JSON::stringify(&msg_obj)?;
+                 ws.send_with_str(&msg_str.as_string().unwrap())?;
+            }
+            
+            Ok(sdp)
         } else {
             Err(JsValue::from_str("Peer not found"))
         }
@@ -357,7 +561,27 @@ impl PeerManager {
     pub async fn create_answer(&self, peer_id: String, offer_sdp: String) -> Result<String, JsValue> {
         let peers = self.peers.borrow();
         if let Some(conn) = peers.get(&peer_id) {
-            conn.create_answer(offer_sdp).await
+            let sdp = conn.create_answer(offer_sdp).await?;
+            
+            // Send answer via signaling
+            if let Some(ws) = self.websocket.borrow().as_ref() {
+                 let sdp_obj = js_sys::Object::new();
+                 js_sys::Reflect::set(&sdp_obj, &JsValue::from_str("type"), &JsValue::from_str("answer"))?;
+                 js_sys::Reflect::set(&sdp_obj, &JsValue::from_str("sdp"), &JsValue::from_str(&sdp))?;
+                 
+                 let payload = js_sys::Object::new();
+                 js_sys::Reflect::set(&payload, &JsValue::from_str("target"), &JsValue::from_str(&peer_id))?;
+                 js_sys::Reflect::set(&payload, &JsValue::from_str("data"), &sdp_obj)?;
+                 
+                 let msg_obj = js_sys::Object::new();
+                 js_sys::Reflect::set(&msg_obj, &JsValue::from_str("type"), &JsValue::from_str("Signal"))?;
+                 js_sys::Reflect::set(&msg_obj, &JsValue::from_str("payload"), &payload)?;
+                 
+                 let msg_str = js_sys::JSON::stringify(&msg_obj)?;
+                 ws.send_with_str(&msg_str.as_string().unwrap())?;
+            }
+            
+            Ok(sdp)
         } else {
             Err(JsValue::from_str("Peer not found"))
         }
@@ -393,7 +617,6 @@ impl PeerManager {
     pub fn broadcast_message(&self, message: String) -> Result<(), JsValue> {
         let peers = self.peers.borrow();
         for (_, conn) in peers.iter() {
-            // Ignore errors for individual peers, try to send to all
             let _ = conn.send_message(&message);
         }
         Ok(())
@@ -409,5 +632,13 @@ impl PeerManager {
 
     pub fn set_on_peer_connection_state_change(&self, callback: js_sys::Function) {
         *self.on_peer_connection_state_change.borrow_mut() = Some(callback);
+    }
+    
+    pub fn set_on_peer_joined(&self, callback: js_sys::Function) {
+        *self.on_peer_joined.borrow_mut() = Some(callback);
+    }
+    
+    pub fn set_on_peer_left(&self, callback: js_sys::Function) {
+        *self.on_peer_left.borrow_mut() = Some(callback);
     }
 }
